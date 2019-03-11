@@ -62,7 +62,7 @@ func main() {
 	fe := filterEventsForTime(events, startTime)
 	oe := organizeEvents(fe)
 	md := oe.markdown()
-	log.Print("\n" + md)
+	fmt.Println(md)
 }
 
 func oauthClient() *http.Client {
