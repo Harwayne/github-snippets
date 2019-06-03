@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -60,7 +61,8 @@ func main() {
 	client := github.NewClient(oauthClient())
 	events := listEvents(client)
 	fe := filterEventsForTime(events, startTime)
-	oe := organizeEvents(fe)
+	ge := organizeEvents(fe)
+	oe := ge.makeEventSets(client)
 	md := oe.markdown()
 	fmt.Println(md)
 }
@@ -111,18 +113,31 @@ func filterEventsForTime(unfiltered []*github.Event, startTime time.Time) []*git
 }
 
 type url string
+type urlSet map[url]struct{}
 
 type eventSets struct {
-	names map[url]string
-	merged      map[url]struct{}
-	abandoned   map[url]struct{}
-	underReview map[url]struct{}
-	inProgress  map[url]struct{}
-	reviewed    map[url]struct{}
-	issues      map[url]struct{}
+	names       map[url]string
+	merged      urlSet
+	abandoned   urlSet
+	underReview urlSet
+	inProgress  urlSet
+	reviewed    urlSet
+	issues      urlSet
 }
 
-func organizeEvents(events []*github.Event) *eventSets {
+type issuesAndPRs struct {
+	names  map[url]string
+	issues map[url]*github.Issue
+	prs    map[url]prInfo
+}
+
+type prInfo struct {
+	owner  string
+	repo   string
+	number int
+}
+
+func organizeEvents(events []*github.Event) *issuesAndPRs {
 	parsed := make([]interface{}, 0, len(events))
 	for _, event := range events {
 		p, err := event.ParsePayload()
@@ -131,109 +146,32 @@ func organizeEvents(events []*github.Event) *eventSets {
 		}
 		parsed = append(parsed, p)
 	}
-	eventSets := &eventSets{
-		names: make(map[url]string),
-		merged:      make(map[url]struct{}),
-		abandoned:   make(map[url]struct{}),
-		underReview: make(map[url]struct{}),
-		inProgress:  make(map[url]struct{}),
-		reviewed:    make(map[url]struct{}),
-		issues:      make(map[url]struct{}),
+	ge := &issuesAndPRs{
+		names:  make(map[url]string),
+		issues: make(map[url]*github.Issue),
+		prs:    make(map[url]prInfo),
 	}
 	for _, event := range parsed {
 		switch e := event.(type) {
-
 		case *github.IssueCommentEvent:
-			eventSets.addName(e.Issue)
-			if e.Issue.IsPullRequest() {
-				if e.Issue.User.GetLogin() == *user {
-					eventSets.underReview[getURL(e.Issue)] = struct{}{}
-				} else {
-					eventSets.reviewed[getURL(e.Issue)] = struct{}{}
-				}
-			} else {
-				eventSets.issues[getURL(e.Issue)] = struct{}{}
-			}
+			ge.addIssue(e.Issue)
 		case *github.IssuesEvent:
-			switch e.GetAction() {
-			case "opened":
-			case "edited":
-			case "deleted":
-			case "closed":
-			case "assigned":
-			}
-			eventSets.addName(e.Issue)
-			if e.Issue.IsPullRequest() {
-				eventSets.reviewed[getURL(e.Issue)] = struct{}{}
-			} else {
-				eventSets.issues[getURL(e.Issue)] = struct{}{}
-				log.Printf("Added issueevent %s", getURL(e.Issue))
-			}
+			ge.addIssue(e.Issue)
 		case *github.PullRequestEvent:
-			eventSets.addName(e.PullRequest)
-			switch e.GetAction() {
-			case "opened":
-				if strings.Contains(e.PullRequest.GetTitle(), "WIP") {
-					eventSets.inProgress[getURL(e.PullRequest)] = struct{}{}
-				} else {
-					eventSets.underReview[getURL(e.PullRequest)] = struct{}{}
-				}
-			case "edited":
-				eventSets.inProgress[getURL(e.PullRequest)] = struct{}{}
-			case "closed":
-				log.Printf("pr %+v", e.PullRequest)
-				if e.PullRequest.GetMerged() {
-					eventSets.merged[getURL(e.PullRequest)] = struct{}{}
-				} else {
-					eventSets.abandoned[getURL(e.PullRequest)] = struct{}{}
-				}
-			case "reopened":
-				eventSets.inProgress[getURL(e.PullRequest)] = struct{}{}
-			default:
-				log.Printf("Unknown pull request action: %s", e.GetAction())
-			}
+			ge.addPR(e.PullRequest)
 		case *github.PullRequestReviewCommentEvent:
-			eventSets.addName(e.PullRequest)
-			if e.PullRequest.User.GetLogin() == *user {
-				eventSets.underReview[getURL(e.PullRequest)] = struct{}{}
-			} else {
-				eventSets.reviewed[getURL(e.PullRequest)] = struct{}{}
-			}
+			ge.addPR(e.PullRequest)
 		// Everything below this line is ignored for now.
 		case *github.CommitCommentEvent:
 			log.Printf("Hit a commitCommentEvent")
 		case *github.CreateEvent:
-			// Probably not much for now.
-			if *e.RefType == "branch" {
-
-			} else if *e.RefType == "tag" {
-
-			}
 		case *github.PushEvent:
-			// Ignore.
 		case *github.DeleteEvent:
-			// Ignore.
 		default:
 			log.Printf("Hit some other event type: %T", event)
 		}
 	}
-	eventSets.cleanUp()
-	return eventSets
-}
-
-func (e *eventSets) cleanUp() {
-	// Anything that has been merged or cleaned up is no longer in progress or under review.
-	for pr := range e.merged {
-		delete(e.underReview, pr)
-		delete(e.inProgress, pr)
-	}
-	for pr := range e.abandoned {
-		delete(e.underReview, pr)
-		delete(e.inProgress, pr)
-	}
-	for pr := range e.underReview {
-		delete(e.inProgress, pr)
-	}
+	return ge
 }
 
 func (e *eventSets) markdown() string {
@@ -272,16 +210,124 @@ type nameable interface {
 	GetHTMLURL() string
 }
 
+func (e *issuesAndPRs) addName(n nameable) url {
+	url := url(n.GetHTMLURL())
+	// Since we iterate in reverse chronological order, the first entry, should be the most
+	// up-to-date.
+	if _, ok := e.names[url]; !ok {
+		e.overrideName(url, n)
+	}
+	return url
+}
+
+func (e *issuesAndPRs) overrideName(url url, n nameable) {
+	e.names[url] = fmt.Sprintf("[%s](%s)", n.GetTitle(), n.GetHTMLURL())
+}
+
+func (e *issuesAndPRs) addIssue(i *github.Issue) {
+	url := e.addName(i)
+	if i.IsPullRequest() {
+		e.prs[url] = crackPRInfo(i.GetHTMLURL())
+	} else if _, ok := e.issues[url]; !ok {
+		e.issues[url] = i
+	}
+}
+
+func (e *issuesAndPRs) addPR(pr *github.PullRequest) {
+	url := e.addName(pr)
+	if _, ok := e.prs[url]; !ok {
+		e.prs[url] = crackPRInfo(pr.GetHTMLURL())
+	}
+}
+
 func (e *eventSets) addName(n nameable) {
 	url := url(n.GetHTMLURL())
 	// Since we iterate in reverse chronological order, the first entry, should be the most
 	// up-to-date.
 	if _, ok := e.names[url]; !ok {
 		e.names[url] = fmt.Sprintf("[%s](%s)", n.GetTitle(), n.GetHTMLURL())
-		log.Printf("Added name: %q %q", url, e.names[url])
 	}
 }
 
-func getURL(n nameable) url {
-	return url(n.GetHTMLURL())
+func (e *issuesAndPRs) makeEventSets(client *github.Client) *eventSets {
+	eventSets := &eventSets{
+		names:       e.names,
+		merged:      urlSet{},
+		abandoned:   urlSet{},
+		underReview: urlSet{},
+		inProgress:  urlSet{},
+		reviewed:    urlSet{},
+		issues:      urlSet{},
+	}
+
+	// Make sure we have the newest PRs.
+	prs := e.getPRs(client)
+	for url, pr := range prs {
+		if pr.GetUser().GetLogin() != *user {
+			eventSets.reviewed[url] = struct{}{}
+			continue
+		}
+		switch pr.GetState() {
+		case "open":
+			if isWorkInProgress(pr.Labels) {
+				eventSets.inProgress[url] = struct{}{}
+			} else {
+				eventSets.underReview[url] = struct{}{}
+			}
+		case "closed":
+			if pr.GetMerged() {
+				eventSets.merged[url] = struct{}{}
+			} else {
+				eventSets.abandoned[url] = struct{}{}
+			}
+		default:
+			log.Printf("PR is in an unknown state: %+v", pr)
+		}
+	}
+
+	eventSets.names = e.names
+	return eventSets
+}
+
+func (e *issuesAndPRs) getPRs(client *github.Client) map[url]*github.PullRequest {
+	newPRs := make(map[url]*github.PullRequest)
+	for url, pr := range e.prs {
+		newPR, _, err := client.PullRequests.Get(context.TODO(), pr.owner, pr.repo, pr.number)
+		if err != nil {
+			log.Fatalf("Unable to get PR: %q, %v", url, err)
+		}
+		newPRs[url] = newPR
+		e.overrideName(url, newPR)
+	}
+	return newPRs
+}
+
+func isWorkInProgress(labels []*github.Label) bool {
+	for _, l := range labels {
+		if l.GetName() == "do-not-merge/work-in-progress" {
+			return true
+		}
+	}
+	return false
+}
+
+func crackPRInfo(url string) prInfo {
+	prefix := "https://github.com/"
+	if !strings.HasPrefix(url, prefix) {
+		log.Fatalf("Bad prefix: %q", url)
+	}
+	url = strings.TrimPrefix(url, prefix)
+	splits := strings.Split(url, "/")
+	if len(splits) < 4 {
+		log.Fatalf("Incorrect number of splits: %q", url)
+	}
+	n, err := strconv.Atoi(splits[3])
+	if err != nil {
+		log.Fatalf("Unable to parse the fourth split: %q", url)
+	}
+	return prInfo{
+		owner:  splits[0],
+		repo:   splits[1],
+		number: n,
+	}
 }
