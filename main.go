@@ -110,13 +110,16 @@ func filterEventsForTime(unfiltered []*github.Event, startTime time.Time) []*git
 	return events
 }
 
+type url string
+
 type eventSets struct {
-	merged      map[string]bool
-	abandoned   map[string]bool
-	underReview map[string]bool
-	inProgress  map[string]bool
-	reviewed    map[string]bool
-	issues      map[string]bool
+	names map[url]string
+	merged      map[url]struct{}
+	abandoned   map[url]struct{}
+	underReview map[url]struct{}
+	inProgress  map[url]struct{}
+	reviewed    map[url]struct{}
+	issues      map[url]struct{}
 }
 
 func organizeEvents(events []*github.Event) *eventSets {
@@ -129,33 +132,27 @@ func organizeEvents(events []*github.Event) *eventSets {
 		parsed = append(parsed, p)
 	}
 	eventSets := &eventSets{
-		merged:      make(map[string]bool),
-		abandoned:   make(map[string]bool),
-		underReview: make(map[string]bool),
-		inProgress:  make(map[string]bool),
-		reviewed:    make(map[string]bool),
-		issues:      make(map[string]bool),
+		names: make(map[url]string),
+		merged:      make(map[url]struct{}),
+		abandoned:   make(map[url]struct{}),
+		underReview: make(map[url]struct{}),
+		inProgress:  make(map[url]struct{}),
+		reviewed:    make(map[url]struct{}),
+		issues:      make(map[url]struct{}),
 	}
 	for _, event := range parsed {
 		switch e := event.(type) {
-		case *github.CommitCommentEvent:
-			log.Printf("Hit a commitCommentEvent")
-		case *github.CreateEvent:
-			// Probably not much for now.
-			if *e.RefType == "branch" {
 
-			} else if *e.RefType == "tag" {
-
-			}
 		case *github.IssueCommentEvent:
+			eventSets.addName(e.Issue)
 			if e.Issue.IsPullRequest() {
 				if e.Issue.User.GetLogin() == *user {
-					eventSets.underReview[issueTitle(e.Issue)] = true
+					eventSets.underReview[getURL(e.Issue)] = struct{}{}
 				} else {
-					eventSets.reviewed[issueTitle(e.Issue)] = true
+					eventSets.reviewed[getURL(e.Issue)] = struct{}{}
 				}
 			} else {
-				eventSets.issues[issueTitle(e.Issue)] = true
+				eventSets.issues[getURL(e.Issue)] = struct{}{}
 			}
 		case *github.IssuesEvent:
 			switch e.GetAction() {
@@ -165,41 +162,56 @@ func organizeEvents(events []*github.Event) *eventSets {
 			case "closed":
 			case "assigned":
 			}
+			eventSets.addName(e.Issue)
 			if e.Issue.IsPullRequest() {
-				eventSets.reviewed[issueTitle(e.Issue)] = true
+				eventSets.reviewed[getURL(e.Issue)] = struct{}{}
 			} else {
-				eventSets.issues[issueTitle(e.Issue)] = true
-				log.Printf("Added issueevent %s", issueTitle(e.Issue))
+				eventSets.issues[getURL(e.Issue)] = struct{}{}
+				log.Printf("Added issueevent %s", getURL(e.Issue))
 			}
 		case *github.PullRequestEvent:
+			eventSets.addName(e.PullRequest)
 			switch e.GetAction() {
 			case "opened":
 				if strings.Contains(e.PullRequest.GetTitle(), "WIP") {
-					eventSets.inProgress[prTitle(e.PullRequest)] = true
+					eventSets.inProgress[getURL(e.PullRequest)] = struct{}{}
 				} else {
-					eventSets.underReview[prTitle(e.PullRequest)] = true
+					eventSets.underReview[getURL(e.PullRequest)] = struct{}{}
 				}
 			case "edited":
-				eventSets.inProgress[prTitle(e.PullRequest)] = true
+				eventSets.inProgress[getURL(e.PullRequest)] = struct{}{}
 			case "closed":
 				log.Printf("pr %+v", e.PullRequest)
 				if e.PullRequest.GetMerged() {
-					eventSets.merged[prTitle(e.PullRequest)] = true
+					eventSets.merged[getURL(e.PullRequest)] = struct{}{}
 				} else {
-					eventSets.abandoned[prTitle(e.PullRequest)] = true
+					eventSets.abandoned[getURL(e.PullRequest)] = struct{}{}
 				}
 			case "reopened":
-				eventSets.inProgress[prTitle(e.PullRequest)] = true
+				eventSets.inProgress[getURL(e.PullRequest)] = struct{}{}
 			default:
 				log.Printf("Unknown pull request action: %s", e.GetAction())
 			}
 		case *github.PullRequestReviewCommentEvent:
+			eventSets.addName(e.PullRequest)
 			if e.PullRequest.User.GetLogin() == *user {
-				eventSets.underReview[prTitle(e.PullRequest)] = true
+				eventSets.underReview[getURL(e.PullRequest)] = struct{}{}
 			} else {
-				eventSets.reviewed[prTitle(e.PullRequest)] = true
+				eventSets.reviewed[getURL(e.PullRequest)] = struct{}{}
+			}
+		// Everything below this line is ignored for now.
+		case *github.CommitCommentEvent:
+			log.Printf("Hit a commitCommentEvent")
+		case *github.CreateEvent:
+			// Probably not much for now.
+			if *e.RefType == "branch" {
+
+			} else if *e.RefType == "tag" {
+
 			}
 		case *github.PushEvent:
+			// Ignore.
+		case *github.DeleteEvent:
 			// Ignore.
 		default:
 			log.Printf("Hit some other event type: %T", event)
@@ -227,34 +239,49 @@ func (e *eventSets) cleanUp() {
 func (e *eventSets) markdown() string {
 	md := make([]string, 0)
 	md = append(md, "* GitHub")
-	md = append(md, printSection(e.merged, "Merged")...)
-	md = append(md, printSection(e.abandoned, "Abandoned")...)
-	md = append(md, printSection(e.underReview, "Under Review")...)
-	md = append(md, printSection(e.inProgress, "In Progress")...)
-	md = append(md, printSection(e.reviewed, "Reviewed")...)
-	md = append(md, printSection(e.issues, "Issues")...)
+	md = append(md, printSection(e.names, e.merged, "Merged")...)
+	md = append(md, printSection(e.names, e.abandoned, "Abandoned")...)
+	md = append(md, printSection(e.names, e.underReview, "Under Review")...)
+	md = append(md, printSection(e.names, e.inProgress, "In Progress")...)
+	md = append(md, printSection(e.names, e.reviewed, "Reviewed")...)
+	md = append(md, printSection(e.names, e.issues, "Issues")...)
 
 	markdown := strings.Join(md, "\n")
 	markdown = strings.Replace(markdown, "\t", "    ", -1)
 	return markdown
 }
 
-func printSection(section map[string]bool, title string) []string {
+func printSection(names map[url]string, section map[url]struct{}, title string) []string {
 	if len(section) > 0 {
 		md := make([]string, 0, len(section)+1)
 		md = append(md, fmt.Sprintf("\t* %s", title))
-		for pr := range section {
-			md = append(md, fmt.Sprintf("\t\t* %s", pr))
+		for url := range section {
+			if name, ok := names[url]; ok {
+				md = append(md, fmt.Sprintf("\t\t* %s", name))
+			} else {
+				log.Printf("Did not have a name for: %q", url)
+			}
 		}
 		return md
 	}
 	return make([]string, 0)
 }
 
-func prTitle(pr *github.PullRequest) string {
-	return fmt.Sprintf("[%s](%s)", pr.GetTitle(), pr.GetHTMLURL())
+type nameable interface {
+	GetTitle() string
+	GetHTMLURL() string
 }
 
-func issueTitle(issue *github.Issue) string {
-	return fmt.Sprintf("[%s](%s)", issue.GetTitle(), issue.GetHTMLURL())
+func (e *eventSets) addName(n nameable) {
+	url := url(n.GetHTMLURL())
+	// Since we iterate in reverse chronological order, the first entry, should be the most
+	// up-to-date.
+	if _, ok := e.names[url]; !ok {
+		e.names[url] = fmt.Sprintf("[%s](%s)", n.GetTitle(), n.GetHTMLURL())
+		log.Printf("Added name: %q %q", url, e.names[url])
+	}
+}
+
+func getURL(n nameable) url {
+	return url(n.GetHTMLURL())
 }
