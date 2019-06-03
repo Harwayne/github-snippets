@@ -285,6 +285,10 @@ func (e *issuesAndPRs) makeEventSets(client *github.Client) *eventSets {
 		}
 	}
 
+	for url := range e.issues {
+		eventSets.issues[url] = struct{}{}
+	}
+
 	eventSets.names = e.names
 	return eventSets
 }
