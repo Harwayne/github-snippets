@@ -161,12 +161,15 @@ func organizeEvents(events []*github.Event) *issuesAndPRs {
 			ge.addPR(e.PullRequest)
 		case *github.PullRequestReviewCommentEvent:
 			ge.addPR(e.PullRequest)
+		case *github.PullRequestReviewEvent:
+			ge.addPR(e.PullRequest)
 		// Everything below this line is ignored for now.
 		case *github.CommitCommentEvent:
 			log.Printf("Hit a commitCommentEvent")
 		case *github.CreateEvent:
 		case *github.PushEvent:
 		case *github.DeleteEvent:
+		case *github.ForkEvent:
 		default:
 			log.Printf("Hit some other event type: %T", event)
 		}
